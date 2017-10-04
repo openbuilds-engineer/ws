@@ -1,0 +1,2061 @@
+"use strict";
+/*
+	Credits:
+    Based off lw.comm-server by github.com/cprezzi
+    Based off laserweb comms work by github.com/openhardwarecoza
+	  Electron Bundler provided by:  https://github.com/krolco and https://github.com/copet80
+
+    THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+    WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+    MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+    ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+    WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+    ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+    OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+
+    This program is free software: you can redistribute it and/or modify
+    it under the terms of the GNU Affero General Public License as published by
+    the Free Software Foundation, either version 3 of the License.
+
+    This program is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    GNU Affero General Public License for more details.
+
+    You should have received a copy of the GNU Affero General Public License
+    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+*/
+
+const config = require('./config');
+const serialport = require('serialport');
+var SerialPort = serialport;
+const websockets = require('socket.io');
+const http = require('http');
+const WebSocket = require('ws');
+const net = require('net');
+const os = require('os');
+const fs = require('fs');
+const nstatic = require('node-static');
+const url = require('url');
+const util = require('util');
+const chalk = require('chalk');
+const request = require('request'); // proxy for remote webcams
+const grblStrings = require('./grblStrings.js');
+const firmwareFeatures = require('./firmwareFeatures.js');
+
+var logFile;
+var connectionType, connections = [];
+var gcodeQueue = [];
+var port, connectedTo, portsList;
+var machineSocket, connectedIp;
+var telnetBuffer, espBuffer;
+
+var statusLoop, queueCounter, listPortsLoop;
+var lastSent = '', paused = false, blocked = false;
+
+var firmware, fVersion, fDate;
+var feedOverride = 100;
+var spindleOverride = 100;
+var laserTestOn = false;
+
+var runningJob;
+var startTime;
+var queueLen;
+var queuePos = 0;
+var queuePointer = 0;
+
+var optimizeGcode = false;
+
+var supportedInterfaces = ['USB'];
+
+var GRBL_RX_BUFFER_SIZE = 128; // 128 characters
+var grblBufferSize = [];
+var new_grbl_buffer = false;
+
+var SMOOTHIE_RX_BUFFER_SIZE = 64;  // max. length of one command line
+var smoothie_buffer = false;
+var lastMode;
+
+var TINYG_RX_BUFFER_SIZE = 24;              // max. lines of gcode to send before wait for ok
+var tinygBufferSize = TINYG_RX_BUFFER_SIZE; // init space left
+var jsObject;
+
+var REPRAP_RX_BUFFER_SIZE = 2;                  // max. lines of gcode to send before wait for ok
+var reprapBufferSize = REPRAP_RX_BUFFER_SIZE;   // init space left
+var reprapWaitForPos = false;
+
+var xPos = 0.00, yPos = 0.00, zPos = 0.00, aPos = 0.00;
+var xOffset = 0.00, yOffset = 0.00, zOffset = 0.00, aOffset = 0.00;
+var has4thAxis = false;
+
+var statusjson = {
+  machine: {
+    tools: {
+      hotend1: false,
+      hotend2: false,
+      heatbed: false,
+      laser:   false,
+      spindle: false,
+    },
+    overrides: {
+      feedOverride: 0, //
+      spindleOverride: 0, //
+      realFeed: 0, //
+      realSpindle: 0, //
+    },
+    position: {
+      work: {
+        x: 0,
+        y: 0,
+        z: 0,
+        a: 0,
+        e: 0,
+      },
+      offset: {
+        x: 0,
+        y: 0,
+        z: 0,
+        a: 0,
+        e: 0
+      }
+
+    },
+    temperature: {
+      setpoint: {
+          t0: 0,
+          t1: 0,
+          b: 0
+      },
+      actual: {
+        t0: 0,
+        t1: 0,
+        b: 0
+      }
+    },
+    firmware: {
+      type: "",
+      version: "",
+      date: ""
+    }
+  },
+  comms: {
+    connectionStatus: 0, //0 = not connected, 1 = opening, 2 = connected, 3 = playing, 4 = paused
+    runStatus: 0,// 0 = init, 1 = idle, 2 = alarm, 3 = stop, 4 = run, etc?
+    queue: 0,
+    controllerBuffer: 0, // Seems like you are tracking available buffer?  Maybe nice to have in frontend?
+    interfaces: {
+      supportedInterfaces: ['USB'],
+      ports: portsList,
+      activeInterface: "",
+      activePort: "" // or activeIP in the case of wifi/telnet?
+    },
+    alarm: "",
+  }
+};
+
+
+require('dns').lookup(require('os').hostname(), function (err, add, fam) {
+    writeLog(chalk.green('***************************************************************'), 0);
+    writeLog(chalk.white(' cncpro serial to websocket json server (SWJS) ver: ' + config.serverVersion), 0);
+    writeLog(chalk.green('***************************************************************'), 0);
+    writeLog(chalk.white('  Use ') + chalk.yellow(' http://' + add + ':' + config.webPort) + chalk.white(' to connect this server.'), 0);
+    writeLog(chalk.green('***************************************************************'));
+    writeLog(chalk.green(' '), 0);
+});
+
+
+// Init webserver
+var webServer = new nstatic.Server('./app');
+var app = http.createServer(function (req, res) {
+    var queryData = url.parse(req.url, true).query;
+    if (queryData.url) {
+        if (queryData.url !== '') {
+            request({
+                url: queryData.url, // proxy for remote webcams
+                callback: function (err, res, body) {
+                    if (err) {
+                        // writeLog(err)
+                        console.error(chalk.red('ERROR:'), chalk.yellow(' Remote Webcam Proxy error: '), chalk.white('"' + queryData.url + '"'), chalk.yellow(' is not a valid URL: '));
+                    }
+                }
+            }).on('error', function (e) {
+                res.end(e);
+            }).pipe(res);
+        }
+    } else {
+        webServer.serve(req, res, function (err, result) {
+            if (err) {
+                console.error(chalk.red('ERROR:'), chalk.yellow(' webServer error:' + req.url + ' : '), err.message);
+            }
+        });
+    }
+});
+app.listen(config.webPort);
+var io = websockets.listen(app);
+
+// WebSocket connection from frontend
+io.sockets.on('connection', function (appSocket) {
+    // save new connection
+    connections.push(appSocket);
+    writeLog(chalk.yellow('App connected! (id=' + connections.indexOf(appSocket) + ')'), 1);
+
+    // statusloop
+    var interval = setInterval(function() {
+      appSocket.emit('statusjson', statusjson);
+    }, 1000);
+
+    statusjson.comms.interfaces.supportedInterfaces = supportedInterfaces
+
+    // check available ports
+    serialport.list(function (err, ports) {
+        portsList = ports;
+        statusjson.comms.interfaces.ports = portsList;
+    });
+    // reckeck ports every 2s
+    listPortsLoop = setInterval(function () {
+        serialport.list(function (err, ports) {
+            if (JSON.stringify(ports) != JSON.stringify(portsList)) {
+                portsList = ports;
+                statusjson.comms.interfaces.ports = portsList;
+            }
+        });
+    }, 2000);
+
+    appSocket.on('connectTo', function (data) { // If a user picks a port to connect to, open a Node SerialPort Instance to it
+      if (statusjson.comms.connectionStatus < 1) {
+        data = data.split(',');
+        writeLog(chalk.yellow('INFO: ') + chalk.blue('Connecting via ' + data[0] +' to ' + data[1] + ' at baud ' + data[2]), 1);
+        switch (data[0]) {
+        case 'usb':
+            port = new SerialPort(data[1], {
+                parser: serialport.parsers.readline('\n'),
+                baudrate: parseInt(data[2])
+            });
+            statusjson.comms.connectionStatus = 1
+            statusjson.comms.interfaces.activeInterface = 'usb';
+            statusjson.comms.interfaces.activePort = port.path
+            statusjson.comms.interfaces.activeBaud = port.options.baudRate
+            // Serial port events -----------------------------------------------
+            port.on('open', function () {
+                statusjson.comms.connectionStatus = 1
+                statusjson.comms.interfaces.activeInterface = 'usb';
+                statusjson.comms.interfaces.activePort = port.path
+                statusjson.comms.interfaces.activeBaud = port.options.baudRate
+                if (config.resetOnConnect == 1) {
+                    port.write(String.fromCharCode(0x18)); // ctrl-x (needed for rx/tx connection)
+                    writeLog('Sent: ctrl-x', 1);
+                } else {
+                    machineSend('\n'); // this causes smoothie to send the welcome string
+                }
+                setTimeout(function () { //wait for controller to be ready
+                    if (!statusjson.machine.firmware.type) { // Grbl should be allready detected
+                        // console.log("No GRBL, lets see if we have Smoothie?")
+                        machineSend('version\n'); // Check if it's Smoothieware?
+                        writeLog('Sent: version', 2);
+                        setTimeout(function () {  // Wait for Smoothie to answer
+                            if (!statusjson.machine.firmware.type) {     // If still not set
+                              console.log('Firmware:', statusjson.machine.firmware.type)
+                              // console.log("No GRBL, No Smoothie, lets see if we have TinyG?")
+                                machineSend('{fb:n}\n'); // Check if it's TinyG
+                                writeLog('Sent: {fb:n}', 2);
+                                setTimeout(function () {  // Wait for TinyG to answer
+                                    if (!statusjson.machine.firmware.type) {     // If still not set
+                                        console.log('Firmware:', statusjson.machine.firmware.type)
+                                        // console.log("No GRBL, No Smoothie, No TinyG lets see if we have Marlin/Repetier?")
+                                        machineSend('M115\n'); // Check if it's Repetier or MarlinKimbra
+                                        reprapBufferSize--;
+                                        writeLog('Sent: M115', 2);
+                                    }
+                                }, config.tinygWaitTime * 1000);
+                            }
+                        }, config.smoothieWaitTime * 1000);
+                    }
+                }, config.grblWaitTime * 1000);
+                if (config.firmwareWaitTime > 0) {
+                    setTimeout(function () {
+                        // Close port if we don't detect supported firmware after 2s.
+                        if (!statusjson.machine.firmware.type) {
+                            writeLog('No supported firmware detected. Closing port ' + port.path, 1);
+                            statusjson.comms.connectionStatus = 0;
+                            clearInterval(queueCounter);
+                            clearInterval(statusLoop);
+                            gcodeQueue.length = 0; // dump the queye
+                            grblBufferSize.length = 0; // dump bufferSizes
+                            tinygBufferSize = TINYG_RX_BUFFER_SIZE; // reset tinygBufferSize
+                            reprapBufferSize = REPRAP_RX_BUFFER_SIZE; // reset reprapBufferSize
+                            reprapWaitForPos = false;
+                            port.close();
+                        }
+                    }, config.firmwareWaitTime * 1000);
+                }
+                // machineSend("M115\n");    // Lets check if its Marlin?
+
+                writeLog(chalk.yellow('PORT INFO: ') + 'Connected to ' + port.path + ' at ' + port.options.baudRate, 1);
+                statusjson.comms.connectionStatus = 2;
+                statusjson.comms.interfaces.activeInterface = 'usb';
+                statusjson.comms.interfaces.activePort = port.path
+                statusjson.comms.interfaces.activeBaud = port.options.baudRate
+
+            }); // end port .onopen
+
+            port.on('close', function () { // open errors will be emitted as an error event
+                clearInterval(queueCounter);
+                clearInterval(statusLoop);
+                writeLog(chalk.yellow('PORT INFO: ') + chalk.blue('Port closed'), 1);
+                statusjson.comms.interfaces.activePort = false;
+                statusjson.comms.interfaces.activeInterface = false
+                statusjson.comms.interfaces.activeBaud = false;
+                statusjson.comms.connectionStatus = 0
+            }); // end port.onclose
+
+            port.on('error', function (err) { // open errors will be emitted as an error event
+                writeLog(chalk.red('PORT ERROR: ') + chalk.blue(err.message), 1);
+                statusjson.comms.interfaces.activePort = false;
+                statusjson.comms.interfaces.activeInterface = false
+                statusjson.comms.interfaces.activeBaud = false;
+                statusjson.comms.connectionStatus = 0
+            });
+
+            port.on('data', function (data) {
+              // console.log(data);
+              statusjson.comms.connectionStatus = 2
+                writeLog('Recv: ' + data, 3);
+                if (data.indexOf("ok T:") == 0) { // Got an Temperature Feedback (Smoothie)
+                  var heaterT0ActualTemp, heaterT0DisplayTemp, heaterT1ActualTemp, heaterT1DisplayTemp, bedActualTemp, bedDisplayTemp
+                    // console.log(response);
+                    for (var r, n = /(B|T(\d*)):\s*([+]?[0-9]*\.?[0-9]+)? (\/)([+]?[0-9]*\.?[0-9]+)?/gi; null !== (r = n.exec(data));) {
+                        var o = r[1],
+                            a = r[3] + "°C";
+                            a += "/" + r[5] + "°C", "T" == o ? (heaterT0ActualTemp = r[3], heaterT0DisplayTemp = r[5]) : "T1" == o && (heaterT1ActualTemp = r[3], heaterT1DisplayTemp = r[5]), "B" == o && (bedActualTemp = Number(r[3]), bedDisplayTemp = r[5])
+                    }
+
+                    if (heaterT0ActualTemp) {
+                       statusjson.machine.temperature.setpoint.t0 = parseFloat(heaterT0DisplayTemp);
+                       statusjson.machine.temperature.actual.t0 = parseFloat(heaterT0ActualTemp);
+                    }
+
+                    if (heaterT1ActualTemp) {
+                      statusjson.machine.temperature.setpoint.t1 = parseFloat(heaterT1DisplayTemp);
+                      statusjson.machine.temperature.actual.t1 = parseFloat(heaterT1ActualTemp);
+                    }
+
+                    if (bedActualTemp) {
+                      statusjson.machine.temperature.setpoint.b = parseFloat(bedDisplayTemp);
+                      statusjson.machine.temperature.actual.b = parseFloat(bedActualTemp);
+                    }
+
+                } else if (data.indexOf('ok') === 0) { // Got an OK so we are clear to send
+                    if (statusjson.machine.firmware.type === 'grbl') {
+                        grblBufferSize.shift();
+                    }
+                    if (statusjson.machine.firmware.type === 'repetier' || statusjson.machine.firmware.type === 'marlinkimbra') {
+                        reprapBufferSize++;
+                    }
+                    blocked = false;
+                    send1Q();
+                } else if (data.indexOf('<') === 0) { // Got statusReport (Grbl & Smoothieware)
+                    var state = data.substring(1, data.search(/(,|\|)/));
+                    //appSocket.emit('runStatus', state);
+                    statusjson.comms.runStatus = state
+                    if (statusjson.machine.firmware.type == 'grbl') {
+                        // Extract wPos (for Grbl > 1.1 only!)
+                        var startWPos = data.search(/wpos:/i) + 5;
+                        var wPos;
+                        if (startWPos > 5) {
+                            var wPosLen = data.substr(startWPos).search(/>|\|/);
+                            wPos = data.substr(startWPos, wPosLen).split(/,/);
+                        }
+                        if (Array.isArray(wPos)) {
+                            if (xPos !== parseFloat(wPos[0]).toFixed(config.posDecimals)) {
+                                xPos = parseFloat(wPos[0]).toFixed(config.posDecimals);
+                            }
+                            if (yPos !== parseFloat(wPos[1]).toFixed(config.posDecimals)) {
+                                yPos = parseFloat(wPos[1]).toFixed(config.posDecimals);
+                            }
+                            if (zPos !== parseFloat(wPos[2]).toFixed(config.posDecimals)) {
+                                zPos = parseFloat(wPos[2]).toFixed(config.posDecimals);
+                            }
+                            if (wPos.length > 3) {
+                                if (aPos !== parseFloat(wPos[3]).toFixed(config.posDecimals)) {
+                                    aPos = parseFloat(wPos[3]).toFixed(config.posDecimals);
+                                    has4thAxis = true;
+                                }
+                            }
+                            if (has4thAxis) {
+                                statusjson.machine.position.work.x = xPos
+                                statusjson.machine.position.work.y = yPos
+                                statusjson.machine.position.work.z = zPos
+                                statusjson.machine.position.work.a = aPos
+                            } else {
+                                statusjson.machine.position.work.x = xPos
+                                statusjson.machine.position.work.y = yPos
+                                statusjson.machine.position.work.z = zPos
+                            }
+                        } // END IS WPOS
+                        // Extract work offset (for Grbl > 1.1 only!)
+                        var startWCO = data.search(/wco:/i) + 4;
+                        var wco;
+                        if (startWCO > 4) {
+                            wco = data.replace('>', '').substr(startWCO).split(/,|\|/, 4);
+                        }
+                        if (Array.isArray(wco)) {
+                            xOffset = parseFloat(wco[0]).toFixed(config.posDecimals);
+                            yOffset = parseFloat(wco[1]).toFixed(config.posDecimals);
+                            zOffset = parseFloat(wco[2]).toFixed(config.posDecimals);
+                            if (has4thAxis) {
+                                aOffset = parseFloat(wco[3]).toFixed(config.posDecimals);
+                                statusjson.machine.offset.x = xOffset;
+                                statusjson.machine.offset.y = yOffset;
+                                statusjson.machine.offset.z = zOffset;
+                                statusjson.machine.offset.a = aOffset;
+                            } else {
+                                statusjson.machine.offset.x = xOffset;
+                                statusjson.machine.offset.y = yOffset;
+                                statusjson.machine.offset.z = zOffset;
+                            }
+                        }
+                    }
+                    if (statusjson.machine.firmware.type == 'smoothie') {
+                        // Extract wPos (for Smoothieware only!)
+                        var startWPos = data.search(/wpos:/i) + 5;
+                        var wPos;
+                        if (startWPos > 5) {
+                            wPos = data.replace('>', '').substr(startWPos).split(/,/, 4);
+                        }
+                        if (Array.isArray(wPos)) {
+                            if (xPos !== wPos[0]) {
+                                xPos = wPos[0];
+                            }
+                            if (yPos !== wPos[1]) {
+                                yPos = wPos[1];
+                            }
+                            if (zPos !== wPos[2]) {
+                                zPos = wPos[2];
+                            }
+                            if (wPos.length > 3) {
+                                if (aPos !== wPos[3]) {
+                                    aPos = wPos[3];
+                                    has4thAxis = true;
+                                }
+                            }
+                            if (has4thAxis) {
+                                statusjson.machine.position.work.x = xPos
+                                statusjson.machine.position.work.y = yPos
+                                statusjson.machine.position.work.z = zPos
+                                statusjson.machine.position.work.a = aPos
+                            } else {
+                                statusjson.machine.position.work.x = xPos
+                                statusjson.machine.position.work.y = yPos
+                                statusjson.machine.position.work.z = zPos
+                            }
+                        }
+                        // Extract mPos (for Smoothieware only!)
+                        var startMPos = data.search(/mpos:/i) + 5;
+                        var mPos;
+                        if (startMPos > 5) {
+                            mPos = data.replace('>', '').substr(startMPos).split(/,|\|/, 4);
+                        }
+                        if (Array.isArray(mPos)) {
+                            if (xOffset != mPos[0] - xPos) {
+                                xOffset = mPos[0] - xPos;
+                            }
+                            if (yOffset != mPos[1] - yPos) {
+                                yOffset = mPos[1] - yPos;
+                            }
+                            if (zOffset != mPos[2] - zPos) {
+                                zOffset = mPos[2] - zPos;
+                            }
+                            if (has4thAxis) {
+                                if (aOffset != mPos[3] - aPos) {
+                                    aOffset = mPos[3] - aPos;
+                                }
+                            }
+                            if (has4thAxis) {
+                                statusjson.machine.position.offset.x = parseFloat(xOffset).toFixed(config.posDecimals);
+                                statusjson.machine.position.offset.y = parseFloat(yOffset).toFixed(config.posDecimals);
+                                statusjson.machine.position.offset.z = parseFloat(zOffset).toFixed(config.posDecimals);
+                                statusjson.machine.position.offset.a = parseFloat(aOffset).toFixed(config.posDecimals);
+                            } else {
+                              statusjson.machine.position.offset.x = parseFloat(xOffset).toFixed(config.posDecimals);
+                              statusjson.machine.position.offset.y = parseFloat(yOffset).toFixed(config.posDecimals);
+                              statusjson.machine.position.offset.z = parseFloat(zOffset).toFixed(config.posDecimals);
+                            }
+                        }
+                    }
+                    // Extract override values (for Grbl > v1.1 only!)
+                    var startOv = data.search(/ov:/i) + 3;
+                    if (startOv > 3) {
+                        var ov = data.replace('>', '').substr(startOv).split(/,|\|/, 3);
+                        if (Array.isArray(ov)) {
+                            if (ov[0]) {
+                                statusjson.machine.overrides.feedOverride = ov[0];
+                            }
+                            if (ov[1]) {
+                                statusjson.machine.overrides.rapidOverride = ov[1];
+                            }
+                            if (ov[2]) {
+                                statusjson.machine.overrides.spindleOverride = ov[2];
+                            }
+                        }
+                    }
+                    // Extract realtime Feed and Spindle (for Grbl > v1.1 only!)
+                    var startFS = data.search(/FS:/i) + 3;
+                    if (startFS > 3) {
+                        var fs = data.replace('>', '').substr(startFS).split(/,|\|/, 2);
+                        if (Array.isArray(fs)) {
+                            if (fs[0]) {
+                                statusjson.machine.overrides.realFeed = fs[0];
+                            }
+                            if (fs[1]) {
+                                statusjson.machine.overrides.realSpindle = fs[1];
+                            }
+                        }
+                    }
+                } else if (data.indexOf('X') === 0) {   // Extract wPos for Repetier
+                    var pos;
+                    var startPos = data.search(/x:/i) + 2;
+                    if (startPos >= 2) {
+                        pos = data.substr(startPos, 4);
+                        if (xPos !== parseFloat(pos).toFixed(config.posDecimals)) {
+                            xPos = parseFloat(pos).toFixed(config.posDecimals);
+                        }
+                    }
+                    var startPos = data.search(/y:/i) + 2;
+                    if (startPos >= 2) {
+                        pos = data.substr(startPos, 4);
+                        if (yPos !== parseFloat(pos).toFixed(config.posDecimals)) {
+                            yPos = parseFloat(pos).toFixed(config.posDecimals);
+                        }
+                    }
+                    var startPos = data.search(/z:/i) + 2;
+                    if (startPos >= 2) {
+                        pos = data.substr(startPos, 4);
+                        if (zPos !== parseFloat(pos).toFixed(config.posDecimals)) {
+                            zPos = parseFloat(pos).toFixed(config.posDecimals);
+                        }
+                    }
+                    var startPos = data.search(/e:/i) + 2;
+                    if (startPos >= 2) {
+                        pos = data.substr(startPos, 4);
+                        if (aPos !== parseFloat(pos).toFixed(config.posDecimals)) {
+                            aPos = parseFloat(pos).toFixed(config.posDecimals);
+                        }
+                    }
+                    statusjson.machine.position.work.x = xPos
+                    statusjson.machine.position.work.y = yPos
+                    statusjson.machine.position.work.z = zPos
+                    statusjson.machine.position.work.a = aPos
+                    //writeLog('wPos: X:' + xPos + ' Y:' + yPos + ' Z:' + zPos + ' E:' + aPos, 3);
+                    reprapWaitForPos = false;
+
+                } else if (data.indexOf('Grbl') === 0) { // Check if it's Grbl
+                    statusjson.machine.firmware.type = 'grbl';
+                    statusjson.machine.firmware.version = data.substr(5, 4); // get version
+                    statusjson.machine.firmware.date = '';
+                    writeLog('GRBL detected', 1);
+                    // Start intervall for status queries
+                    statusLoop = setInterval(function () {
+                        if (statusjson.comms.connectionStatus > 0) {
+                            machineSend('?');
+                            //writeLog('Sent: ?', 2);
+                        }
+                    }, 250);
+                } else if (data.indexOf('LPC176') >= 0) { // LPC1768 or LPC1769 should be Smoothie
+                    //SMOOTHIE_RX_BUFFER_SIZE = 64;  // max. length of one command line
+                    writeLog('Smoothieware detected', 1);
+                    statusjson.machine.firmware.type = 'smoothie';
+                    statusjson.machine.firmware.version = data.substr(data.search(/version:/i) + 9).split(/,/, 1);
+                    statusjson.machine.firmware.date = new Date(data.substr(data.search(/Build date:/i) + 12).split(/,/, 1)).toDateString();
+                    // Start intervall for status queries
+                    statusLoop = setInterval(function () {
+                        if (statusjson.comms.connectionStatus > 0) {
+                            machineSend('?');
+                            if (statusjson.machine.tools.hotend1 || statusjson.machine.tools.hotend2 || statusjson.machine.tools.heatbed)
+                            machineSend('M105\n');
+                            //writeLog('Sent: ?', 2);
+                        }
+                    }, 250);
+                    // Lets see what we have to deal with
+                    setTimeout(function () {
+                      machineSend('config-get extruder.hotend.enable\n');            //cached: extruder.hotend.enable is set to true
+                    }, 100 );
+                    setTimeout(function () {
+                      machineSend('config-get extruder.hotend2.enable\n');        //cached: extruder.hotend2.enable is not in config
+                    }, 200 );
+                    setTimeout(function () {
+                      machineSend('config-get temperature_control.bed.enable\n'); //cached: temperature_control.bed.enable is set to true
+                    }, 300 );
+                    setTimeout(function () {
+                      machineSend('config-get laser_module_enable\n');            //cached: laser_module_enable is set to false
+                    }, 400 );
+                    setTimeout(function () {
+                      machineSend('config-get spindle.enable\n');                 //cached: spindle.enable is not in config
+                    }, 500 );
+
+                } else if (data.indexOf('cached: extruder.hotend.enable') === 0) {
+                    console.log("Adding 1st Extruder to Tools table");
+                    if (data.indexOf('set to true') != -1) {
+                      statusjson.machine.tools.hotend1 = true
+                    }
+                } else if (data.indexOf('cached: extruder.hotend2.enable') === 0) {
+                    console.log("Adding 2nd Extruder to Tools table");
+                    if (data.indexOf('set to true') != -1) {
+                      statusjson.machine.tools.hotend2 = true
+                    }
+                } else if (data.indexOf('cached: temperature_control.bed.enable') === 0) {
+                    console.log("Adding Heatbed to Tools table");
+                    if (data.indexOf('set to true') != -1) {
+                      statusjson.machine.tools.heatbed = true
+                    }
+                } else if (data.indexOf('cached: laser_module_enable') === 0) {
+                    console.log("Adding Laser to Tools table");
+                    if (data.indexOf('set to true') != -1) {
+                      statusjson.machine.tools.laser = true
+                    }
+                } else if (data.indexOf('cached: spindle.enable') === 0) {
+                    console.log("Adding Spindle to Tools table");
+                    if (data.indexOf('set to true') != -1) {
+                      statusjson.machine.tools.spindle = true
+                    }
+                } else if (data.indexOf('start') === 0) { // Check if it's RepRap
+                    machineSend('M115\n'); // Check if it's Repetier or MarlinKimbra
+                    reprapBufferSize--;
+                    writeLog('Sent: M115', 2);
+                } else if (data.indexOf('FIRMWARE_NAME:Repetier') >= 0) { // Check if it's Repetier
+                    writeLog('Repetier detected', 1);
+                    statusjson.machine.firmware.type = 'repetier';
+                    statusjson.machine.firmware.version = data.substr(data.search(/repetier_/i) + 9, 4);
+                    statusjson.machine.firmware.date = '';
+                    // Start intervall for status queries
+                    statusLoop = setInterval(function () {
+                        if (statusjson.comms.connectionStatus > 0) {
+                            if (!reprapWaitForPos && reprapBufferSize > 0) {
+                                reprapWaitForPos = true;
+                                machineSend('M114\n'); // query position
+                                reprapBufferSize--;
+                                writeLog('Sent: M114 (B' + reprapBufferSize + ')', 2);
+                            }
+                        }
+                    }, 250);
+                } else if (data.indexOf('FIRMWARE_NAME:MK') >= 0) { // Check if it's MarlinKimbra
+                    writeLog('MarlinKimbra detected', 1);
+                    statusjson.machine.firmware.type = 'marlinkimbra';
+                    statusjson.machine.firmware.version = data.substr(data.search(/mk_/i) + 3, 5);
+                    statusjson.machine.firmware.date = '';
+                    // Start intervall for status queries
+                    statusLoop = setInterval(function () {
+                        if (statusjson.comms.connectionStatus > 0) {
+                            if (!reprapWaitForPos && reprapBufferSize >= 0) {
+                                reprapWaitForPos = true;
+                                machineSend('M114\n'); // query position
+                                reprapBufferSize--;
+                                writeLog('Sent: M114 (B' + reprapBufferSize + ')', 2);
+                            }
+                        }
+                    }, 250);
+                } else if (data.indexOf('{') === 0 ) { // JSON response (probably TinyG)
+                  console.log('about to hit a JSON', data)
+                    var jsObject = JSON.parse(data);
+                    if (jsObject.hasOwnProperty('r')) {
+                        var footer = jsObject.f || (jsObject.r && jsObject.r.f);
+                        var responseText;
+                        if (footer !== undefined) {
+                            if (footer[1] === 108) {
+                                responseText = util.format("TinyG reported an syntax error reading '%s': %d (based on %d bytes read)", JSON.stringify(jsObject.r), footer[1], footer[2]);
+                                writeLog("Response: " + responseText + jsObject, 3);
+                            } else if (footer[1] === 20) {
+                                responseText = util.format("TinyG reported an internal error reading '%s': %d (based on %d bytes read)", JSON.stringify(jsObject.r), footer[1], footer[2]);
+                                writeLog("Response: " + responseText + jsObject, 3);
+                            } else if (footer[1] === 202) {
+                                responseText = util.format("TinyG reported an TOO SHORT MOVE on line %d", jsObject.r.n);
+                                writeLog("Response: " + responseText + jsObject, 3);
+                            } else if (footer[1] === 204) {
+                                responseText = util.format("TinyG reported COMMAND REJECTED BY ALARM '%s'", JSON.stringify(jsObject.r));
+                                writeLog("InAlarm: " + responseText + jsObject, 3);
+                            } else if (footer[1] !== 0) {
+                                responseText = util.format("TinyG reported an error reading '%s': %d (based on %d bytes read)", JSON.stringify(jsObject.r), footer[1], footer[2]);
+                                writeLog("Response: " + responseText + jsObject, 3);
+                            } else {
+                                // do nothing with +data
+                            }
+                            console.log('data', responseText);
+                        }
+                        //writeLog('Response: ' + JSON.stringify(jsObject.r) + ', ' + footer, 3);
+                        jsObject = jsObject.r;
+
+                        tinygBufferSize++;
+                        blocked = false;
+                        send1Q();
+                    }
+                    if (jsObject.hasOwnProperty('sr')) {    // status report
+                        //writeLog('statusChanged ' + JSON.stringify(jsObject.sr), 3);
+                        if (jsObject.sr.posx != null) {
+                            xPos = parseFloat(jsObject.sr.posx).toFixed(config.posDecimals);
+                        }
+                        if (jsObject.sr.posy != null) {
+                            yPos = parseFloat(jsObject.sr.posy).toFixed(config.posDecimals);
+                        }
+                        if (jsObject.sr.posz != null) {
+                            zPos = parseFloat(jsObject.sr.posz).toFixed(config.posDecimals);
+                        }
+                        if (jsObject.sr.posa != null) {
+                            aPos = parseFloat(jsObject.sr.posa).toFixed(config.posDecimals);
+                        }
+                        statusjson.machine.position.work.x = xPos
+                        statusjson.machine.position.work.y = yPos
+                        statusjson.machine.position.work.z = zPos
+                        statusjson.machine.position.work.a = aPos
+                        if (jsObject.sr.stat) {
+                            var status = null;
+                            switch (jsObject.sr.stat) {
+                                case 0:     // initializing
+                                    status = 'Init';
+                                    break;
+                                case 1:     // ready
+                                    status = 'Idle';
+                                    break;
+                                case 2:     // shutdown
+                                    status = 'Alarm';
+                                    break;
+                                case 3:     // stop
+                                    status = 'Idle';
+                                    break;
+                                case 4:     // end
+                                    status = 'Idle';
+                                    break;
+                                case 5:     // run
+                                    status = 'Run';
+                                    break;
+                                case 6:     // hold
+                                    status = 'Hold';
+                                    break;
+                                case 7:     // probe cycle
+                                    status = 'Probe';
+                                    break;
+                                case 8:     // running / cycling
+                                    status = 'Run';
+                                    break;
+                                case 9:     // homing
+                                    status = 'Home';
+                                    break;
+                            }
+                            if (status) {
+                                writeLog('Status: ' + status, 3);
+                            }
+                        }
+                    }
+                    if (jsObject.hasOwnProperty('fb')) {    // firmware
+                        writeLog('TinyG detected', 1);
+                        statusjson.machine.firmware.type = 'tinyg';
+                        statusjson.machine.firmware.version = jsObject.fb;
+                        statusjson.machine.firmware.date = '';
+                        // Start intervall for status queries
+  //                            statusLoop = setInterval(function () {
+  //                                if (statusjson.comms.connectionStatus > 0) {
+  //                                    machineSend('{sr:n}\n');
+  //                                    //writeLog('Sent: {"sr":null}', 2);
+  //                                }
+  //                            }, 250);
+                    }
+                    if (jsObject.hasOwnProperty('gc')) {
+                        writeLog('gcodeReceived ' + jsObject.r.gc, 3);
+                    }
+                    if (jsObject.hasOwnProperty('rx')) {
+                        writeLog('rxReceived ' + jsObject.r.rx, 3);
+                    }
+                    if (jsObject.hasOwnProperty('er')) {
+                        writeLog('errorReport ' + jsObject.er, 3);
+                    }
+                } else if (data.indexOf('ALARM') === 0) { //} || data.indexOf('HALTED') === 0) {
+                    switch (statusjson.machine.firmware.type) {
+                    case 'grbl':
+                        grblBufferSize.shift();
+                        var alarmCode = parseInt(data.split(':')[1]);
+                        writeLog('ALARM: ' + alarmCode + ' - ' + grblStrings.alarms(alarmCode));
+                        statusjson.comms.alarm = alarmCode + ' - ' + grblStrings.alarms(alarmCode)
+                        break;
+                    case 'smoothie':
+                        statusjson.comms.alarm = data;
+                        break;
+                    case 'tinyg':
+                        statusjson.comms.alarm = data;
+                        break;
+                    case 'repetier':
+                        statusjson.comms.alarm = data;
+                        break;
+                    case 'marlinkimbra':
+                        statusjson.comms.alarm = data;
+                        break;
+                    }
+                } else if (data.indexOf('wait') === 0) { // Got wait from Repetier -> ignore
+                    // do nothing
+                } else if (data.indexOf('Resend') === 0) { // Got resend from Repetier -> TODO: resend corresponding line!!!
+                    switch (statusjson.machine.firmware.type) {
+                    case 'repetier':
+                        break;
+                    case 'marlinkimbra':
+                        break;
+                    }
+                } else if (data.indexOf('error') === 0) { // Error received -> stay blocked stops queue
+                    switch (statusjson.machine.firmware.type) {
+                    case 'grbl':
+                        grblBufferSize.shift();
+                        var errorCode = parseInt(data.split(':')[1]);
+                        writeLog('error: ' + errorCode + ' - ' + grblStrings.errors(errorCode));
+                        io.sockets.emit('data', 'error: ' + errorCode + ' - ' + grblStrings.errors(errorCode));
+                        break;
+                    case 'smoothie':
+                        io.sockets.emit('data', data);
+                        break;
+                    case 'tinyg':
+                        io.sockets.emit('data', data);
+                        break;
+                    case 'repetier':
+                        io.sockets.emit('data', data);
+                        break;
+                    case 'marlinkimbra':
+                        io.sockets.emit('data', data);
+                        break;
+                    }
+                } else if (data === ' ') {
+                    // nothing
+                } else {
+                    // do nothing with +data
+                }
+            });
+            break;
+            } // end switch
+          } // end if connectionStatus
+        }); // end on ConnectTo
+
+    appSocket.on('runJob', function (data) {
+        writeLog('Run Job (' + data.length + ')', 1);
+        if (statusjson.comms.connectionStatus > 0) {
+            if (data) {
+                runningJob = data;
+                data = data.split('\n');
+                for (var i = 0; i < data.length; i++) {
+                    var line = data[i].split(';'); // Remove everything after ; = comment
+                    var tosend = line[0].trim();
+                    if (tosend.length > 0) {
+                        if (optimizeGcode) {
+                            var newMode;
+                            if (tosend.indexOf('G0') === 0) {
+                                tosend = tosend.replace(/\s+/g, '');
+                                newMode = 'G0';
+                            } else if (tosend.indexOf('G1') === 0) {
+                                tosend = tosend.replace(/\s+/g, '');
+                                newMode = 'G1';
+                            } else if (tosend.indexOf('G2') === 0) {
+                                tosend = tosend.replace(/\s+/g, '');
+                                newMode = 'G2';
+                            } else if (tosend.indexOf('G3') === 0) {
+                                tosend = tosend.replace(/\s+/g, '');
+                                newMode = 'G3';
+                            } else if (tosend.indexOf('X') === 0) {
+                                tosend = tosend.replace(/\s+/g, '');
+                            } else if (tosend.indexOf('Y') === 0) {
+                                tosend = tosend.replace(/\s+/g, '');
+                            } else if (tosend.indexOf('Z') === 0) {
+                                tosend = tosend.replace(/\s+/g, '');
+                            } else if (tosend.indexOf('A') === 0) {
+                                tosend = tosend.replace(/\s+/g, '');
+                            }
+                            if (newMode) {
+                                if (newMode === lastMode) {
+                                    tosend.substr(2);
+                                } else {
+                                    lastMode = newMode;
+                                }
+                            }
+                        }
+                        //console.log(line);
+                        addQ(tosend);
+                    }
+                }
+                if (i > 0) {
+                    startTime = new Date(Date.now());
+                    // Start interval for qCount messages to socket clients
+                    queueCounter = setInterval(function () {
+                         statusjson.comms.queue = gcodeQueue.length - queuePointer
+                    }, 500);
+                    send1Q();
+                }
+            }
+        } else {
+            statusjson.comms.connectionStatus = 0;
+            writeLog(chalk.red('ERROR: ') + chalk.blue('Machine connection not open!'), 1);
+        }
+    });
+
+    appSocket.on('runCommand', function (data) {
+        writeLog(chalk.red('Run Command (' + data.replace('\n', '|') + ')'), 1);
+        if (statusjson.comms.connectionStatus > 0) {
+            if (data) {
+                data = data.split('\n');
+                for (var i = 0; i < data.length; i++) {
+                    var line = data[i].split(';'); // Remove everything after ; = comment
+                    var tosend = line[0].trim();
+                    if (tosend.length > 0) {
+                        addQ(tosend);
+                    }
+                }
+                if (i > 0) {
+                    statusjson.comms.runStatus = 'running'
+                    send1Q();
+                }
+            }
+        } else {
+            statusjson.comms.connectionStatus = 0;
+            writeLog(chalk.red('ERROR: ') + chalk.blue('Machine connection not open!'), 1);
+        }
+    });
+
+    appSocket.on('jog', function (data) {
+        writeLog(chalk.red('Jog ' + data), 1);
+        if (statusjson.comms.connectionStatus > 0) {
+            data = data.split(',');
+            var dir = data[0];
+            var dist = parseFloat(data[1]);
+            var feed;
+            if (data.length > 2) {
+                feed = parseInt(data[2]);
+                if (feed) {
+                    feed = 'F' + feed;
+                }
+            }
+            if (dir && dist && feed) {
+                writeLog('Adding jog commands to queue. blocked=' + blocked + ', paused=' + paused + ', Q=' + gcodeQueue.length);
+                switch (statusjson.machine.firmware.type) {
+                case 'grbl':
+                    addQ('$J=G91' + dir + dist + feed);
+                    send1Q();
+                    break;
+                case 'smoothie':
+                    addQ('G91');
+                    addQ('G0' + feed + dir + dist);
+                    addQ('G90');
+                    send1Q();
+                    break;
+                case 'tinyg':
+                    addQ('G91');
+                    addQ('G0' + feed + dir + dist);
+                    addQ('G90');
+                    send1Q();
+                    break;
+                case 'repetier':
+                case 'marlinkimbra':
+                    addQ('G91');
+                    addQ('G0' + feed + dir + dist);
+                    addQ('G90');
+                    send1Q();
+                    break;
+                default:
+                    writeLog(chalk.red('ERROR: ') + chalk.blue('Unknown firmware!'), 1);
+                    break;
+                }
+            } else {
+                writeLog(chalk.red('ERROR: ') + chalk.blue('Invalid params!'), 1);
+            }
+        } else {
+            statusjson.comms.connectionStatus = 0;
+            writeLog(chalk.red('ERROR: ') + chalk.blue('Machine connection not open!'), 1);
+        }
+    });
+
+    appSocket.on('jogTo', function (data) {     // data = {x:xVal, y:yVal, z:zVal, mode:0(absulute)|1(relative), feed:fVal}
+        writeLog(chalk.red('JogTo ' + JSON.stringify(data)), 1);
+        if (statusjson.comms.connectionStatus > 0) {
+            if (data.x !== undefined || data.y !== undefined || data.z !== undefined) {
+                var xVal = (data.x !== undefined ? 'X' + parseFloat(data.x) : '');
+                var yVal = (data.y !== undefined ? 'Y' + parseFloat(data.y) : '');
+                var zVal = (data.z !== undefined ? 'Z' + parseFloat(data.z) : '');
+                var mode = ((data.mode == 0) ? 0 : 1);
+                var feed = (data.feed !== undefined ? 'F' + parseInt(data.feed) : '');
+                writeLog('Adding jog commands to queue. blocked=' + blocked + ', paused=' + paused + ', Q=' + gcodeQueue.length);
+                switch (statusjson.machine.firmware.type) {
+                case 'grbl':
+                    addQ('$J=G9' + mode + xVal + yVal + zVal + feed);
+                    send1Q();
+                    break;
+                case 'smoothie':
+                    addQ('G9' + mode);
+                    addQ('G0' + feed + xVal + yVal + zVal);
+                    addQ('G90');
+                    send1Q();
+                    break;
+                case 'tinyg':
+                    addQ('G9' + mode);
+                    addQ('G0' + feed + xVal + yVal + zVal);
+                    addQ('G90');
+                    send1Q();
+                    break;
+                case 'repetier':
+                case 'marlinkimbra':
+                    addQ('G9' + mode);
+                    addQ('G0' + feed + xVal + yVal + zVal);
+                    addQ('G90');
+                    send1Q();
+                    break;
+                default:
+                    writeLog(chalk.red('ERROR: ') + chalk.blue('Unknown firmware!'), 1);
+                    break;
+                }
+            } else {
+                writeLog(chalk.red('error') + chalk.blue('Invalid params!'), 1);
+            }
+        } else {
+            statusjson.comms.connectionStatus = 0;
+            writeLog(chalk.red('ERROR: ') + chalk.blue('Machine connection not open!'), 1);
+        }
+    });
+
+    appSocket.on('setZero', function (data) {
+        writeLog(chalk.red('setZero(' + data + ')'), 1);
+        if (statusjson.comms.connectionStatus > 0) {
+            switch (data) {
+            case 'x':
+                addQ('G10 L20 P0 X0');
+                break;
+            case 'y':
+                addQ('G10 L20 P0 Y0');
+                break;
+            case 'z':
+                addQ('G10 L20 P0 Z0');
+                break;
+            case 'a':
+                addQ('G10 L20 P0 A0');
+                break;
+            case 'all':
+                switch (statusjson.machine.firmware.type) {
+                case 'repetier':
+                    addQ('G92');
+                    break;
+                case 'marlinkimbra':
+                    addQ('G92 X0 Y0 Z0');
+                    break;
+                default:
+                    addQ('G10 L20 P0 X0 Y0 Z0');
+                    break;
+                }
+                break;
+            case 'xyza':
+                addQ('G10 L20 P0 X0 Y0 Z0 A0');
+                break;
+            }
+            send1Q();
+        } else {
+            statusjson.comms.connectStatus  = 0
+            writeLog(chalk.red('ERROR: ') + chalk.blue('Machine connection not open!'), 1);
+        }
+    });
+
+    appSocket.on('gotoZero', function (data) {
+        writeLog(chalk.red('gotoZero(' + data + ')'), 1);
+        if (statusjson.comms.connectionStatus > 0) {
+            switch (data) {
+            case 'x':
+                addQ('G0 X0');
+                break;
+            case 'y':
+                addQ('G0 Y0');
+                break;
+            case 'z':
+                addQ('G0 Z0');
+                break;
+            case 'a':
+                addQ('G0 A0');
+                break;
+            case 'all':
+                addQ('G0 X0 Y0 Z0');
+                break;
+            case 'xyza':
+                addQ('G0 X0 Y0 Z0 A0');
+                break;
+            }
+            send1Q();
+        } else {
+            statusjson.comms.connectionStatus = 0;
+            writeLog(chalk.red('ERROR: ') + chalk.blue('Machine connection not open!'), 1);
+        }
+    });
+
+    appSocket.on('setPosition', function (data) {
+        writeLog(chalk.red('setPosition(' + JSON.stringify(data) + ')'), 1);
+        if (statusjson.comms.connectionStatus > 0) {
+            if (data.x !== undefined || data.y !== undefined || data.z !== undefined) {
+                var xVal = (data.x !== undefined ? 'X' + parseFloat(data.x) + ' ' : '');
+                var yVal = (data.y !== undefined ? 'Y' + parseFloat(data.y) + ' ' : '');
+                var zVal = (data.z !== undefined ? 'Z' + parseFloat(data.z) + ' ' : '');
+                var aVal = (data.a !== undefined ? 'A' + parseFloat(data.a) + ' ' : '');
+                addQ('G10 L20 P0 ' + xVal + yVal + zVal + aVal);
+                send1Q();
+            }
+        } else {
+            statusjson.comms.connectionStatus = 0;
+            writeLog(chalk.red('ERROR: ') + chalk.blue('Machine connection not open!'), 1);
+        }
+    });
+
+    appSocket.on('home', function (data) {
+        writeLog(chalk.red('home(' + data + ')'), 1);
+        if (statusjson.comms.connectionStatus > 0) {
+            switch (data) {
+            case 'x':
+                switch (statusjson.machine.firmware.type) {
+                case 'smoothie':
+                case 'repetier':
+                case 'marlinkimbra':
+                    addQ('G28.2 X');
+                    break;
+                default:
+                    //not supported
+                    appSocket.emit('error', 'Command not supported by firmware!');
+                    break;
+                }
+                break;
+            case 'y':
+                switch (statusjson.machine.firmware.type) {
+                case 'smoothie':
+                case 'repetier':
+                case 'marlinkimbra':
+                    addQ('G28.2 Y');
+                    break;
+                default:
+                    //not supported
+                    appSocket.emit('error', 'Command not supported by firmware!');
+                    break;
+                }
+                break;
+            case 'z':
+                switch (statusjson.machine.firmware.type) {
+                case 'smoothie':
+                case 'repetier':
+                case 'marlinkimbra':
+                    addQ('G28.2 Z');
+                    break;
+                default:
+                    //not supported
+                    appSocket.emit('error', 'Command not supported by firmware!');
+                    break;
+                }
+                break;
+            case 'a':
+                switch (statusjson.machine.firmware.type) {
+                case 'smoothie':
+                case 'repetier':
+                case 'marlinkimbra':
+                    addQ('G28.2 E1');
+                    break;
+                default:
+                    //not supported
+                    appSocket.emit('error', 'Command not supported by firmware!');
+                    break;
+                }
+                break;
+            case 'all': // XYZ only!!
+                switch (statusjson.machine.firmware.type) {
+                case 'grbl':
+                    addQ('$H');
+                    break;
+                case 'smoothie':
+                case 'repetier':
+                case 'marlinkimbra':
+                    addQ('G28.2 X Y Z');
+                    break;
+                default:
+                    //not supported
+                    appSocket.emit('error', 'Command not supported by firmware!');
+                    break;
+                }
+                break;
+            case 'xyza':
+                switch (statusjson.machine.firmware.type) {
+                case 'grbl':
+                    addQ('$H');
+                    break;
+                case 'smoothie':
+                case 'repetier':
+                case 'marlinkimbra':
+                    addQ('G28.2 X Y Z E');
+                    break;
+                default:
+                    //not supported
+                    appSocket.emit('error', 'Command not supported by firmware!');
+                    break;
+                }
+                break;
+            }
+            send1Q();
+        } else {
+            statusjson.comms.connectionStatus = 0;
+            writeLog(chalk.red('ERROR: ') + chalk.blue('Machine connection not open!'), 1);
+        }
+    });
+
+    appSocket.on('probe', function (data) {
+        writeLog(chalk.red('probe(' + JSON.stringify(data) + ')'), 1);
+        if (statusjson.comms.connectionStatus > 0) {
+            switch (statusjson.machine.firmware.type) {
+            case 'smoothie':
+                switch (data.direction) {
+                case 'z':
+                    addQ('G30 Z' + data.probeOffset);
+                    break;
+                default:
+                    addQ('G38.2 ' + data.direction);
+                    break;
+                }
+            case 'grbl':
+                addQ('G38.2 ' + data.direction + '-5 F1');
+                addQ('G92 ' + data.direction + ' ' + data.probeOffset);
+                break;
+            case 'repetier':
+            case 'marlinkimbra':
+                addQ('G38.2 ' + data.direction + '-5 F1');
+                break;
+            default:
+                //not supported
+                appSocket.emit('error', 'Command not supported by firmware!');
+                break;
+            }
+            send1Q();
+        } else {
+            statusjson.comms.connectionStatus = 0;
+            writeLog(chalk.red('ERROR: ') + chalk.blue('Machine connection not open!'), 1);
+        }
+    });
+
+    appSocket.on('feedOverride', function (data) {
+        if (statusjson.comms.connectionStatus > 0) {
+            switch (statusjson.machine.firmware.type) {
+            case 'grbl':
+                var code;
+                switch (data) {
+                case 0:
+                    code = 144; // set to 100%
+                    data = '100';
+                    break;
+                case 10:
+                    code = 145; // +10%
+                    data = '+' + data;
+                    break;
+                case -10:
+                    code = 146; // -10%
+                    break;
+                case 1:
+                    code = 147; // +1%
+                    data = '+' + data;
+                    break;
+                case -1:
+                    code = 148; // -1%
+                    break;
+                }
+                if (code) {
+                    //jumpQ(String.fromCharCode(parseInt(code)));
+                    machineSend(String.fromCharCode(parseInt(code)));
+                    writeLog('Sent: Code(' + code + ')', 2);
+                    writeLog(chalk.red('Feed Override ' + data + '%'), 1);
+                }
+                break;
+            case 'smoothie':
+                if (data === 0) {
+                    feedOverride = 100;
+                } else {
+                    if ((feedOverride + data <= 200) && (feedOverride + data >= 10)) {
+                        // valid range is 10..200, else ignore!
+                        feedOverride += data;
+                    }
+                }
+                //jumpQ('M220S' + feedOverride);
+                machineSend('M220S' + feedOverride + '\n');
+                writeLog('Sent: M220S' + feedOverride, 2);
+                statusjson.machine.overrides.feedOverride = feedOverride
+                writeLog(chalk.red('Feed Override ' + feedOverride.toString() + '%'), 1);
+                //send1Q();
+                break;
+            case 'tinyg':
+                break;
+            case 'repetier':
+            case 'marlinkimbra':
+                if (data === 0) {
+                    feedOverride = 100;
+                } else {
+                    if ((feedOverride + data <= 200) && (feedOverride + data >= 10)) {
+                        // valid range is 10..200, else ignore!
+                        feedOverride += data;
+                    }
+                }
+                machineSend('M220 S' + feedOverride + '\n');
+                reprapBufferSize--;
+                writeLog('Sent: M220 S' + feedOverride, 2);
+                statusjson.machine.overrides.feedOverride = feedOverride
+                writeLog(chalk.red('Feed Override ' + feedOverride.toString() + '%'), 1);
+                break;
+            }
+        } else {
+            statusjson.comms.connectionStatus = 0;
+            writeLog(chalk.red('ERROR: ') + chalk.blue('Machine connection not open!'), 1);
+        }
+    });
+
+    appSocket.on('spindleOverride', function (data) {
+        if (statusjson.comms.connectionStatus > 0) {
+            switch (statusjson.machine.firmware.type) {
+            case 'grbl':
+                var code;
+                switch (data) {
+                case 0:
+                    code = 153; // set to 100%
+                    data = '100';
+                    break;
+                case 10:
+                    code = 154; // +10%
+                    data = '+' + data;
+                    break;
+                case -10:
+                    code = 155; // -10%
+                    break;
+                case 1:
+                    code = 156; // +1%
+                    data = '+' + data;
+                    break;
+                case -1:
+                    code = 157; // -1%
+                    break;
+                }
+                if (code) {
+                    //jumpQ(String.fromCharCode(parseInt(code)));
+                    machineSend(String.fromCharCode(parseInt(code)));
+                    writeLog('Sent: Code(' + code + ')', 2);
+                    writeLog(chalk.red('Spindle (Laser) Override ' + data + '%'), 1);
+                }
+                break;
+            case 'smoothie':
+                if (data === 0) {
+                    spindleOverride = 100;
+                } else {
+                    if ((spindleOverride + data <= 200) && (spindleOverride + data >= 0)) {
+                        // valid range is 0..200, else ignore!
+                        spindleOverride += data;
+                    }
+                }
+                //jumpQ('M221S' + spindleOverride);
+                machineSend('M221S' + spindleOverride + '\n');
+                writeLog('Sent: M221S' + spindleOverride, 2);
+                statusjson.machine.overrides.spindleOverride = spindleOverride;
+                writeLog(chalk.red('Spindle (Laser) Override ' + spindleOverride.toString() + '%'), 1);
+                //send1Q();
+                break;
+            case 'tinyg':
+                break;
+            case 'repetier':
+            case 'marlinkimbra':
+                if (data === 0) {
+                    spindleOverride = 100;
+                } else {
+                    if ((spindleOverride + data <= 200) && (spindleOverride + data >= 0)) {
+                        // valid range is 0..200, else ignore!
+                        spindleOverride += data;
+                    }
+                }
+                machineSend('M221 S' + spindleOverride + '\n');
+                reprapBufferSize--;
+                writeLog('Sent: M221 S' + spindleOverride, 2);
+                statusjson.machine.overrides.spindleOverride = spindleOverride;
+                writeLog(chalk.red('Spindle (Laser) Override ' + spindleOverride.toString() + '%'), 1);
+                break;
+            }
+        } else {
+            statusjson.comms.connectionStatus = 0;
+            writeLog(chalk.red('ERROR: ') + chalk.blue('Machine connection not open!'), 1);
+        }
+    });
+
+    appSocket.on('laserTest', function (data) { // Laser Test Fire
+        if (statusjson.comms.connectionStatus > 0) {
+            data = data.split(',');
+            var power = parseFloat(data[0]);
+            var duration = parseInt(data[1]);
+            var maxS = parseFloat(data[2]);
+            if (power > 0) {
+                if (!laserTestOn) {
+                    // laserTest is off
+                    writeLog('laserTest: ' + 'Power ' + power + ', Duration ' + duration + ', maxS ' + maxS, 1);
+                    if (duration >= 0) {
+                        switch (statusjson.machine.firmware.type) {
+                        case 'grbl':
+                            addQ('G1F1');
+                            addQ('M3S' + parseInt(power * maxS / 100));
+                            laserTestOn = true;
+                            appSocket.emit('laserTest', power);
+                            if (duration > 0) {
+                                addQ('G4 P' + duration / 1000);
+                                addQ('M5S0');
+                                laserTestOn = false;
+                                //appSocket.emit('laserTest', 0); //-> Grbl get the real state with status report
+                            }
+                            send1Q();
+                            break;
+                        case 'smoothie':
+                            addQ('M3\n');
+                            addQ('fire ' + power + '\n');
+                            laserTestOn = true;
+                            appSocket.emit('laserTest', power);
+                            if (duration > 0) {
+                                var divider = 1;
+                                if (fDate >= new Date('2017-01-02')) {
+                                    divider = 1000;
+                                }
+                                addQ('G4P' + duration / divider + '\n');
+                                addQ('fire off\n');
+                                addQ('M5');
+                                setTimeout(function () {
+                                    laserTestOn = false;
+                                    appSocket.emit('laserTest', 0);
+                                }, duration );
+                            }
+                            send1Q();
+                            break;
+                        case 'tinyg':
+                            addQ('G1F1');
+                            addQ('M3S' + parseInt(power * maxS / 100));
+                            laserTestOn = true;
+                            appSocket.emit('laserTest', power);
+                            if (duration > 0) {
+                                addQ('G4 P' + duration / 1000);
+                                addQ('M5S0');
+                                laserTestOn = false;
+                                setTimeout(function () {
+                                    laserTestOn = false;
+                                    appSocket.emit('laserTest', 0);
+                                }, duration );
+                            }
+                            send1Q();
+                            break;
+                        case 'repetier':
+                        case 'marlinkimbra':
+                            addQ('G1F1');
+                            addQ('M3 S' + parseInt(power * maxS / 100));
+                            addQ('M4');
+                            laserTestOn = true;
+                            appSocket.emit('laserTest', power);
+                            if (duration > 0) {
+                                addQ('G4 P' + duration / 1000);
+                                addQ('M5');
+                                laserTestOn = false;
+                                setTimeout(function () {
+                                    laserTestOn = false;
+                                    appSocket.emit('laserTest', 0);
+                                }, duration );
+                            }
+                            send1Q();
+                            break;
+                        }
+                    }
+                } else {
+                    writeLog('laserTest: ' + 'Power off', 1);
+                    switch (statusjson.machine.firmware.type) {
+                    case 'grbl':
+                        addQ('M5S0');
+                        send1Q();
+                        break;
+                    case 'smoothie':
+                        addQ('fire off\n');
+                        addQ('M5\n');
+                        send1Q();
+                        break;
+                    case 'tinyg':
+                        addQ('M5S0');
+                        send1Q();
+                        break;
+                    case 'repetier':
+                    case 'marlinkimbra':
+                        addQ('M5');
+                        send1Q();
+                        break;
+                    }
+                    laserTestOn = false;
+                    appSocket.emit('laserTest', 0);
+                }
+            }
+        } else {
+            statusjson.comms.connectionStatus = 0;
+            writeLog(chalk.red('ERROR: ') + chalk.blue('Machine connection not open!'), 1);
+        }
+    });
+
+    appSocket.on('pause', function () {
+        if (statusjson.comms.connectionStatus > 0) {
+            paused = true;
+            writeLog(chalk.red('PAUSE'), 1);
+            switch (statusjson.machine.firmware.type) {
+            case 'grbl':
+                machineSend('!'); // Send hold command
+                writeLog('Sent: !', 2);
+                if (fVersion === '1.1d') {
+                    machineSend(String.fromCharCode(0x9E)); // Stop Spindle/Laser
+                    writeLog('Sent: Code(0x9E)', 2);
+                }
+                break;
+            case 'smoothie':
+                machineSend('!'); // Laser will be turned off by smoothie (in default config!)
+                //machineSend('M600\n'); // Laser will be turned off by smoothie (in default config!)
+                writeLog('Sent: !', 2);
+                break;
+            case 'tinyg':
+                machineSend('!'); // Send hold command
+                writeLog('Sent: !', 2);
+                break;
+            case 'repetier':
+            case 'marlinkimbra':
+                // just stop sending gcodes
+                break;
+            }
+            statusjson.comms.runStatus = 'paused';
+        } else {
+            statusjson.comms.connectionStatus = 0;
+            writeLog(chalk.red('ERROR: ') + chalk.blue('Machine connection not open!'), 1);
+        }
+    });
+
+    appSocket.on('resume', function () {
+        if (statusjson.comms.connectionStatus > 0) {
+            writeLog(chalk.red('UNPAUSE'), 1);
+            switch (statusjson.machine.firmware.type) {
+            case 'grbl':
+                machineSend('~'); // Send resume command
+                writeLog('Sent: ~', 2);
+                break;
+            case 'smoothie':
+                machineSend('~'); // Send resume command
+                //machineSend('M601\n');
+                writeLog('Sent: ~', 2);
+                break;
+            case 'tinyg':
+                machineSend('~'); // Send resume command
+                writeLog('Sent: ~', 2);
+                break;
+            case 'repetier':
+            case 'marlinkimbra':
+                break;
+            }
+            paused = false;
+            send1Q(); // restart queue
+            statusjson.comms.runStatus = 'resumed';
+        } else {
+            statusjson.comms.connectionStatus = 0;
+            writeLog(chalk.red('ERROR: ') + chalk.blue('Machine connection not open!'), 1);
+        }
+    });
+
+    appSocket.on('stop', function () {
+        if (statusjson.comms.connectionStatus > 0) {
+            paused = true;
+            writeLog(chalk.red('STOP'), 1);
+            switch (statusjson.machine.firmware.type) {
+            case 'grbl':
+                machineSend('!'); // hold
+                writeLog('Sent: !', 2);
+                if (fVersion === '1.1d') {
+                    machineSend(String.fromCharCode(0x9E)); // Stop Spindle/Laser
+                    writeLog('Sent: Code(0x9E)', 2);
+                }
+                writeLog('Cleaning Queue', 1);
+                gcodeQueue.length = 0; // Dump the Queye
+                grblBufferSize.length = 0; // Dump bufferSizes
+                queueLen = 0;
+                queuePointer = 0;
+                queuePos = 0;
+                startTime = null;
+                machineSend(String.fromCharCode(0x18)); // ctrl-x
+                writeLog('Sent: Code(0x18)', 2);
+                blocked = false;
+                paused = false;
+                break;
+            case 'smoothie':
+                paused = true;
+                machineSend(String.fromCharCode(0x18)); // ctrl-x
+                writeLog('Sent: Code(0x18)', 2);
+                break;
+            case 'tinyg':
+                paused = true;
+                machineSend('!'); // hold
+                writeLog('Sent: !', 2);
+                machineSend('%'); // dump TinyG queue
+                writeLog('Sent: %', 2);
+                break;
+            case 'repetier':
+            case 'marlinkimbra':
+                paused = true;
+                machineSend('M112/n'); // hold
+                writeLog('Sent: M112', 2);
+                break;
+            }
+            clearInterval(queueCounter);
+            statusjson.comms.queue = 0
+            gcodeQueue.length = 0; // Dump the Queye
+            grblBufferSize.length = 0; // Dump bufferSizes
+            tinygBufferSize = TINYG_RX_BUFFER_SIZE;  // reset tinygBufferSize
+            reprapBufferSize = REPRAP_RX_BUFFER_SIZE; // reset reprapBufferSize
+            reprapWaitForPos = false;
+            queueLen = 0;
+            queuePointer = 0;
+            queuePos = 0;
+            laserTestOn = false;
+            startTime = null;
+            runningJob = null;
+            blocked = false;
+            paused = false;
+            statusjson.comms.runStatus = 'stopped';
+        } else {
+            statusjson.comms.connectionStatus = 0;
+            writeLog(chalk.red('ERROR: ') + chalk.blue('Machine connection not open!'), 1);
+        }
+    });
+
+    appSocket.on('clearAlarm', function (data) { // Clear Alarm
+        if (statusjson.comms.connectionStatus > 0) {
+            data = parseInt(data);
+            writeLog('Clearing Queue: Method ' + data, 1);
+            switch (data) {
+            case 1:
+                writeLog('Clearing Lockout');
+                switch (statusjson.machine.firmware.type) {
+                case 'grbl':
+                    machineSend('$X\n');
+                    writeLog('Sent: $X', 2);
+                    break;
+                case 'smoothie':
+                    machineSend('$X\n');
+                    writeLog('Sent: $X', 2);
+                    break;
+                case 'tinyg':
+                    machineSend('$X\n');
+                    writeLog('Sent: $X', 2);
+                    break;
+                case 'repetier':
+                case 'marlinkimbra':
+                    machineSend('M112\n');
+                    writeLog('Sent: M112', 2);
+                    break;
+                }
+                writeLog('Resuming Queue Lockout', 1);
+                break;
+            case 2:
+                writeLog('Emptying Queue', 1);
+                gcodeQueue.length = 0; // Dump the Queye
+                grblBufferSize.length = 0; // Dump bufferSizes
+                tinygBufferSize = TINYG_RX_BUFFER_SIZE;  // reset tinygBufferSize
+                reprapBufferSize = REPRAP_RX_BUFFER_SIZE; // reset reprapBufferSize
+                reprapWaitForPos = false;
+                queueLen = 0;
+                queuePointer = 0;
+                queuePos = 0;
+                startTime = null;
+                writeLog('Clearing Lockout', 1);
+                switch (statusjson.machine.firmware.type) {
+                case 'grbl':
+                    machineSend('$X\n');
+                    writeLog('Sent: $X', 2);
+                    blocked = false;
+                    paused = false;
+                    break;
+                case 'smoothie':
+                    machineSend('$X\n'); //M999
+                    writeLog('Sent: $X', 2);
+                    blocked = false;
+                    paused = false;
+                    break;
+                case 'tinyg':
+                    machineSend('%'); // flush tinyg quere
+                    writeLog('Sent: %', 2);
+                    //machineSend('~'); // resume
+                    //writeLog('Sent: ~', 2);
+                    blocked = false;
+                    paused = false;
+                    break;
+                case 'repetier':
+                case 'marlinkimbra':
+                    machineSend('M112/b');
+                    writeLog('Sent: M112', 2);
+                    blocked = false;
+                    paused = false;
+                    break;
+                }
+                break;
+            }
+            statusjson.comms.runStatus = 'stopped'
+        } else {
+            statusjson.comms.connectionStatus = 0;
+            writeLog(chalk.red('ERROR: ') + chalk.blue('Machine connection not open!'), 1);
+        }
+    });
+
+    appSocket.on('resetMachine', function () {
+        if (statusjson.comms.connectionStatus > 0) {
+            writeLog(chalk.red('Reset Machine'), 1);
+            switch (statusjson.machine.firmware.type) {
+            case 'grbl':
+                machineSend(String.fromCharCode(0x18)); // ctrl-x
+                writeLog('Sent: Code(0x18)', 2);
+                break;
+            case 'smoothie':
+                machineSend(String.fromCharCode(0x18)); // ctrl-x
+                writeLog('Sent: Code(0x18)', 2);
+                break;
+            case 'tinyg':
+                machineSend(String.fromCharCode(0x18)); // ctrl-x
+                writeLog('Sent: Code(0x18)', 2);
+                break;
+            case 'repetier':
+            case 'marlinkimbra':
+                machineSend('M112/n');
+                writeLog('Sent: M112', 2);
+                break;
+            }
+        } else {
+            statusjson.comms.connectionStatus = 0;
+            writeLog(chalk.red('ERROR: ') + chalk.blue('Machine connection not open!'), 1);
+        }
+    });
+
+    appSocket.on('closePort', function (data) { // Close machine port and dump queue
+        if (statusjson.comms.connectionStatus > 0) {
+            switch (statusjson.comms.interfaces.activeInterface) {
+            case 'usb':
+                writeLog(chalk.yellow('WARN: ') + chalk.blue('Closing Port ' + port.path), 1);
+                statusjson.comms.connectionStatus = 0;
+                //machineSend(String.fromCharCode(0x18)); // ctrl-x
+                gcodeQueue.length = 0; // dump the queye
+                grblBufferSize.length = 0; // dump bufferSizes
+                tinygBufferSize = TINYG_RX_BUFFER_SIZE; // reset tinygBufferSize
+                reprapBufferSize = REPRAP_RX_BUFFER_SIZE; // reset reprapBufferSize
+                reprapWaitForPos = false;
+                clearInterval(queueCounter);
+                clearInterval(statusLoop);
+                port.close();
+                break;
+            case 'telnet':
+                writeLog(chalk.yellow('WARN: ') + chalk.blue('Closing Telnet @ ' + connectedIp), 1);
+                statusjson.comms.connectionStatus = 0;
+                //machineSend(String.fromCharCode(0x18)); // ctrl-x
+                gcodeQueue.length = 0; // dump the queye
+                grblBufferSize.length = 0; // dump bufferSizes
+                tinygBufferSize = TINYG_RX_BUFFER_SIZE; // reset tinygBufferSize
+                reprapBufferSize = REPRAP_RX_BUFFER_SIZE; // reset reprapBufferSize
+                reprapWaitForPos = false;
+                clearInterval(queueCounter);
+                clearInterval(statusLoop);
+                machineSocket.destroy();
+                break;
+            case 'esp8266':
+                writeLog(chalk.yellow('WARN: ') + chalk.blue('Closing ESP @ ' + connectedIp), 1);
+                statusjson.comms.connectionStatus = 0
+                //machineSend(String.fromCharCode(0x18)); // ctrl-x
+                gcodeQueue.length = 0; // dump the queye
+                grblBufferSize.length = 0; // dump bufferSizes
+                tinygBufferSize = TINYG_RX_BUFFER_SIZE; // reset tinygBufferSize
+                reprapBufferSize = REPRAP_RX_BUFFER_SIZE; // reset reprapBufferSize
+                reprapWaitForPos = false;
+                clearInterval(queueCounter);
+                clearInterval(statusLoop);
+                machineSocket.close();
+                break;
+            }
+        } else {
+            statusjson.comms.connectionStatus = 0;
+            writeLog(chalk.red('ERROR: ') + chalk.blue('Machine connection not open!'), 1);
+        }
+    });
+
+    appSocket.on('disconnect', function () { // App disconnected
+        let id = connections.indexOf(appSocket);
+        writeLog(chalk.yellow('App disconnected! (id=' + id + ')'), 1);
+        connections.splice(id, 1);
+    });
+
+}); // End appSocket
+
+
+// Queue
+function addQ(gcode) {
+    gcodeQueue.push(gcode);
+    queueLen = gcodeQueue.length;
+}
+
+//function jumpQ(gcode) {
+//    gcodeQueue.unshift(gcode);
+//}
+
+function grblBufferSpace() {
+    var total = 0;
+    var len = grblBufferSize.length;
+    for (var i = 0; i < len; i++) {
+        total += grblBufferSize[i];
+    }
+    return GRBL_RX_BUFFER_SIZE - total;
+}
+
+
+function machineSend(gcode) {
+    switch (statusjson.comms.interfaces.activeInterface) {
+    case 'usb':
+        port.write(gcode);
+        break;
+    case 'telnet':
+        machineSocket.write(gcode);
+        break;
+    case 'esp8266':
+        machineSocket.send(gcode);
+        break;
+    }
+}
+
+function send1Q() {
+    var gcode;
+    var gcodeLen = 0;
+    var gcodeLine = '';
+    var spaceLeft = 0;
+    if (statusjson.comms.connectionStatus > 0) {
+        switch (statusjson.machine.firmware.type) {
+        case 'grbl':
+            if (new_grbl_buffer) {
+                if (grblBufferSize.length === 0){
+                    spaceLeft = GRBL_RX_BUFFER_SIZE;
+                    while ((queueLen - queuePointer) > 0 && spaceLeft > 0 && !blocked && !paused) {
+                        gcodeLen = gcodeQueue[queuePointer].length;
+                        if (gcodeLen < spaceLeft) {
+                            // Add gcode to send buffer
+                            gcode = gcodeQueue[queuePointer];
+                            queuePointer++;
+                            grblBufferSize.push(gcodeLen + 1);
+                            gcodeLine += gcode + '\n';
+                            spaceLeft = GRBL_RX_BUFFER_SIZE - gcodeLine.length;
+                        } else {
+                            // Not enough space left in send buffer
+                            blocked = true;
+                        }
+                    }
+                    if (gcodeLine.length > 0) {
+                        // Send the buffer
+                        blocked = true;
+                        machineSend(gcodeLine);
+                        writeLog('Sent: ' + gcodeLine + ' Q: ' + (queueLen - queuePointer), 2);
+                    }
+                }
+            } else {
+                while ((queueLen - queuePointer) > 0 && !blocked && !paused) {
+                    spaceLeft = grblBufferSpace();
+                    gcodeLen = gcodeQueue[queuePointer].length;
+                    if (gcodeLen < spaceLeft) {
+                        gcode = gcodeQueue[queuePointer];
+                        queuePointer++;
+                        grblBufferSize.push(gcodeLen + 1);
+                        machineSend(gcode + '\n');
+                        writeLog('Sent: ' + gcode + ' Q: ' + (queueLen - queuePointer) + ' Bspace: ' + (spaceLeft - gcodeLen - 1), 2);
+                    } else {
+                        blocked = true;
+                    }
+                }
+            }
+            break;
+        case 'smoothie':
+            if (smoothie_buffer) {
+                spaceLeft = SMOOTHIE_RX_BUFFER_SIZE;
+                while ((queueLen - queuePointer) > 0 && spaceLeft > 5 && !blocked && !paused) {
+                    gcodeLen = gcodeQueue[queuePointer].length;
+                    if (gcodeLen < spaceLeft) {
+                        // Add gcode to send buffer
+                        gcodeLine += gcodeQueue[queuePointer];
+                        queuePointer++;
+                        spaceLeft -= gcodeLen;
+                    } else {
+                        // Not enough space left in send buffer
+                        blocked = true;
+                    }
+                }
+                if (gcodeLine.length > 0) {
+                    // Send the buffer
+                    blocked = true;
+                    machineSend(gcodeLine + '\n');
+                    writeLog('Sent: ' + gcodeLine + ' Q: ' + (queueLen - queuePointer), 2);
+                }
+            } else {
+                if ((gcodeQueue.length  - queuePointer) > 0 && !blocked && !paused) {
+                    gcode = gcodeQueue[queuePointer];
+                    queuePointer++;
+                    blocked = true;
+                    machineSend(gcode + '\n');
+                    writeLog('Sent: ' + gcode + ' Q: ' + gcodeQueue.length, 2);
+                }
+            }
+            break;
+        case 'tinyg':
+            while (tinygBufferSize > 0 && gcodeQueue.length > 0 && !blocked && !paused) {
+                gcode = gcodeQueue.shift();
+                machineSend(gcode + '\n');
+                tinygBufferSize--;
+                writeLog('Sent: ' + gcode + ' Q: ' + gcodeQueue.length, 2);
+            }
+            break;
+        case 'repetier':
+        case 'marlinkimbra':
+            while (reprapBufferSize > 0 && gcodeQueue.length > 0 && !blocked && !paused) {
+                gcode = gcodeQueue.shift();
+                machineSend(gcode + '\n');
+                reprapBufferSize--;
+                writeLog('Sent: ' + gcode + ' Q: ' + gcodeQueue.length, 2);
+            }
+            break;
+        }
+        var finishTime, elapsedTimeMS, elapsedTime, speed;
+        if (startTime && (queuePointer - queuePos) >= 500) {
+            queuePos = queuePointer;
+            finishTime = new Date(Date.now());
+            elapsedTimeMS = finishTime.getTime() - startTime.getTime();
+            elapsedTime = Math.round(elapsedTimeMS / 1000);
+            speed = (queuePointer / elapsedTime).toFixed(0);
+            writeLog('Done: ' + queuePointer + ' of ' + queueLen + ' (ave. ' + speed + ' lines/s)', 1);
+        }
+        if (queuePointer >= gcodeQueue.length) {
+            clearInterval(queueCounter);
+            statusjson.comms.queue = 0
+            if (startTime) {
+                finishTime = new Date(Date.now());
+                elapsedTimeMS = finishTime.getTime() - startTime.getTime();
+                elapsedTime = Math.round(elapsedTimeMS / 1000);
+                speed = (queuePointer / elapsedTime).toFixed(0);
+                writeLog("Job started at " + startTime.toString(), 1);
+                writeLog("Job finished at " + finishTime.toString(), 1);
+                writeLog("Elapsed time: " + elapsedTime + " seconds.", 1);
+                writeLog('Ave. Speed: ' + speed + ' lines/s', 1);
+            }
+            gcodeQueue.length = 0; // Dump the Queye
+            grblBufferSize.length = 0; // Dump bufferSizes
+            tinygBufferSize = TINYG_RX_BUFFER_SIZE;  // reset tinygBufferSize
+            reprapBufferSize = REPRAP_RX_BUFFER_SIZE;  // reset tinygBufferSize
+            queueLen = 0;
+            queuePointer = 0;
+            queuePos = 0;
+            startTime = null;
+            runningJob = null;
+            // statusjson.comms.runStatus = 'finished'
+        }
+    } else {
+        statusjson.comms.connectionStatus = 0;
+        writeLog(chalk.red('ERROR: ') + chalk.blue('Error while send1Q(): Machine connection not open!'), 2);
+    }
+}
+
+function isElectron() {
+    if (typeof window !== 'undefined' && window.process && window.process.type === 'renderer') {
+        return true;
+    }
+    if (typeof process !== 'undefined' && process.versions && !!process.versions.electron) {
+        return true;
+    }
+    return false;
+}
+
+function writeLog(line, verb) {
+    if (verb<=config.verboseLevel) {
+        console.log(line);
+    }
+    if (config.logLevel>0 && verb<=config.logLevel) {
+        if (!logFile) {
+            if (isElectron() && os.platform == 'darwin') {
+                logFile = fs.createWriteStream(path.join(electronApp.getPath('userData'),'logfile.txt'));
+            } else {
+                logFile = fs.createWriteStream('./logfile.txt');
+            }
+            logFile.on('error', function(e) { console.error(e); });
+        }
+        var time = new Date().toISOString().replace(/T/, ' ').replace(/\..+/, '');
+        line = line.split(String.fromCharCode(0x1B) + '[31m').join('');
+        line = line.split(String.fromCharCode(0x1B) + '[32m').join('');
+        line = line.split(String.fromCharCode(0x1B) + '[33m').join('');
+        line = line.split(String.fromCharCode(0x1B) + '[34m').join('');
+        line = line.split(String.fromCharCode(0x1B) + '[35m').join('');
+        line = line.split(String.fromCharCode(0x1B) + '[36m').join('');
+        line = line.split(String.fromCharCode(0x1B) + '[37m').join('');
+        line = line.split(String.fromCharCode(0x1B) + '[38m').join('');
+        line = line.split(String.fromCharCode(0x1B) + '[39m').join('');
+        line = line.split(String.fromCharCode(0x1B) + '[94m').join('');
+        logFile.write(time + ' ' + line + '\r\n');
+    }
+}
+
+// Electron app
+const electron = require('electron');
+// Module to control application life.
+const electronApp = electron.app;
+// Keep a global reference of the window object, if you don't, the window will
+// be closed automatically when the JavaScript object is garbage collected.
+var mainWindow = null;
+
+const shouldQuit = electronApp.makeSingleInstance((commandLine, workingDirectory) => {
+  // Someone tried to run a second instance, we should focus our window.
+  if (mainWindow) {
+    if (mainWindow.isMinimized()) mainWindow.restore();
+    mainWindow.focus();
+  }
+});
+
+if (shouldQuit) {
+  electronApp.quit();
+}
+
+// Create myWindow, load the rest of the app, etc...
+// if (electronApp) {
+//     // Module to create native browser window.
+//     const BrowserWindow = electron.BrowserWindow;
+//
+//     function createWindow() {
+//         // Create the browser window.
+//         mainWindow = new BrowserWindow({width: 1200, height: 900, fullscreen: false, center: true, resizable: true, title: "ProjectMaker", frame: true, autoHideMenuBar: true, icon: '/public/favicon.png' });
+//
+//         // and load the index.html of the app.
+//         mainWindow.loadURL('http://127.0.0.1:8000');
+//
+//         // Emitted when the window is closed.
+//         mainWindow.on('closed', function () {
+//             // Dereference the window object, usually you would store windows
+//             // in an array if your app supports multi windows, this is the time
+//             // when you should delete the corresponding element.
+//             mainWindow = null;
+//         });
+//         mainWindow.once('ready-to-show', () => {
+//           mainWindow.show()
+//         })
+//         mainWindow.maximize()
+//         // mainWindow.webContents.openDevTools() // Enable when testing
+//     };
+//
+//     electronApp.commandLine.appendSwitch("--ignore-gpu-blacklist");
+//     electronApp.commandLine.appendSwitch("--disable-http-cache");
+//     // This method will be called when Electron has finished
+//     // initialization and is ready to create browser windows.
+//     // Some APIs can only be used after this event occurs.
+//
+//
+//     electronApp.on('ready', createWindow);
+//
+//     // Quit when all windows are closed.
+//     electronApp.on('window-all-closed', function () {
+//         // On OS X it is common for applications and their menu bar
+//         // to stay active until the user quits explicitly with Cmd + Q
+//         if (process.platform !== 'darwin') {
+//             electronApp.quit();
+//         }
+//     });
+//
+//     electronApp.on('activate', function () {
+//         // On OS X it's common to re-create a window in the app when the
+//         // dock icon is clicked and there are no other windows open.
+//         if (mainWindow === null) {
+//             createWindow();
+//         }
+//     });
+// }

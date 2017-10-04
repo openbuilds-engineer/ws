@@ -1,0 +1,75 @@
+{
+  "name": "opbs-Configurator",
+  "version": "1.0.0",
+  "description": "",
+  "author": "OpenBuilds",
+  "contributors": [
+    "Peter van der Walt <p.walt@openbuilds.com>",
+    "Claudio Prezzi <claudio.prezzi@gmail.com>",
+    "Jorge Robles <jorge.diego.robles@gmail.com>"
+  ],
+  "license": "AGPL-3.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/LaserWeb/lw.comm-server.git"
+  },
+  "dependencies": {
+    "chalk": "*",
+    "dotenv": "*",
+    "node-static": "*",
+    "request": "*",
+    "serialport": "^4.0.7",
+    "socket.io": "1.7.x",
+    "ws": "^1.1.1"
+  },
+  "devDependencies": {
+    "copyfiles": "^1.2.0",
+    "electron": "^1.6.1",
+    "electron-builder": "^14.1.1",
+    "electron-rebuild": "^1.5.7",
+    "ncp": "^2.0.0"
+  },
+  "bugs": {
+    "url": "https://github.com/LaserWeb/lw.comm-server/issues"
+  },
+  "homepage": "https://github.com/LaserWeb/lw.comm-server#readme",
+  "main": "server.js",
+  "scripts": {
+    "start": "echo \"Please run 'npm run dist' to create a local installer, or run 'npm run nightlylinux' or 'npm run nightlywindows' to build distributable installers for each platform\" ",
+    "test": "echo \"Error: no test specified\" && exit 0",
+    "dist": "build"
+  },
+  "keywords": [
+    "grbl",
+    "smoothieware",
+    "tinyg"
+  ],
+  "build": {
+    "appId": "app.configurator",
+    "productName": "Configurator",
+    "asar": true,
+    "files": [
+      "**/*"
+    ],
+    "mac": {
+      "icon": "build/icon.icns",
+      "category": "public.app-category.graphics-design"
+    },
+    "dmg": {
+      "icon": "build/icon.icns",
+      "contents": [
+        {
+          "x": 410,
+          "y": 150,
+          "type": "link",
+          "path": "/Applications"
+        },
+        {
+          "x": 130,
+          "y": 150,
+          "type": "file"
+        }
+      ]
+    }
+  }
+}

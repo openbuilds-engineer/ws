@@ -1,0 +1,364 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <title>cncPro.co CNC Toolset</title>
+    <meta charset="utf-8">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1">
+    <meta name="author" content="Peter vd Walt">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <link rel="stylesheet" href="lib/nprogress/nprogress.css" />
+    <link rel="stylesheet" href="lib/fontawesome/css/font-awesome.css" />
+    <link rel="stylesheet" href="lib/bootstrap/css/bootstrap.min.css" />
+    <link rel="stylesheet" href="lib/css/main.css" />
+  </head>
+  <body>
+
+    <!-- Fixed navbar -->
+   <nav class="navbar navbar-expand-md navbar-dark fixed-top bg-dark">
+     <a class="navbar-brand" href="#">cncPro.co</a>
+     <button class="navbar-toggler" type="button" data-toggle="collapse" data-target="#navbarCollapse" aria-controls="navbarCollapse" aria-expanded="false" aria-label="Toggle navigation">
+       <span class="navbar-toggler-icon"></span>
+     </button>
+     <div class="collapse navbar-collapse" id="navbarCollapse">
+       <ul class="navbar-nav mr-auto">
+         <li class="dropdown" nav-item>
+          <a href="#" class="nav-link dropdown-toggle" data-toggle="dropdown" role="button" aria-haspopup="true" aria-expanded="false"><i class="fa fa-fw fa-calculator" aria-hidden="true"></i>Calculators <span class="caret"></span></a>
+          <div class="dropdown-menu" aria-labelledby="dropdownMenuButton">
+            <h6 class="dropdown-header">Milling Operations</h6>
+            <a class="dropdown-item" href="#" onclick="$('#feeds_modal').modal('show');"><i class="fa fa-fw fa-hourglass-start" aria-hidden="true"></i>Feeds and Speeds</a>
+          </div>
+        </li>
+         <li class="dropdown" nav-item>
+          <a href="#" class="nav-link dropdown-toggle" data-toggle="dropdown" role="button" aria-haspopup="true" aria-expanded="false"><i class="fa fa-fw fa-wrench" aria-hidden="true"></i>Tools <span class="caret"></span></a>
+          <div class="dropdown-menu" aria-labelledby="dropdownMenuButton">
+            <h6 class="dropdown-header">Gcode Manipulation</h6>
+            <a class="dropdown-item" href="#" onclick="$('#scale_modal').modal('show');"><i class="fa fa-fw fa-expand" aria-hidden="true"></i>Scale</a>
+            <a class="dropdown-item" href="#" onclick="$('#rotate_modal').modal('show');"><i class="fa fa-fw fa-repeat" aria-hidden="true"></i>Rotate</a>
+            <a class="dropdown-item" href="#" onclick="$('#translate_modal').modal('show');"><i class="fa fa-fw fa-arrows" aria-hidden="true"></i>Move</a>
+            <!-- <h6 class="dropdown-header">System</h6>
+            <a class="dropdown-item" href="#"><i class="fa fa-fw fa-info" aria-hidden="true"></i>Info</a> -->
+          </div>
+        </li>
+       </ul>
+       <form class="form-inline mt-2 mt-md-0">
+         <!-- <input class="form-control mr-sm-2" type="text" placeholder="Search" aria-label="Search">
+         <button class="btn btn-outline-success my-2 my-sm-0" type="submit">Search</button> -->
+       </form>
+     </div>
+   </nav>
+
+   <!-- Begin page content -->
+      <div class="container-fluid h-100">
+        <div class="row h-100">
+          <div class="col-md-4">
+            <div class="card">
+              <div class="card-header clearfix">
+                <div class="float-left">
+                  <h5>gcode</h5>
+                </div>
+                <div class="float-right">
+                  <span data-toggle="tooltip" data-placement="bottom" title="Open GCODE"   class="btn btn-sm btn-outline-secondary btn-file" title="Open a png, .jpg, .jpeg, .bmp, .gcode, .svg, .dxf, or .stl file" id="openbutton"><i class="fa fa-folder-open fa-fw"></i>open<input id="file" type="file" accept=".png,.jpg,.jpeg,.bmp,.gcode,.g,.svg,.dxf,.stl" /></span>
+                  <button data-toggle="tooltip" data-placement="bottom" title="Save GCODE" class="btn btn-sm btn-sm btn-outline-secondary btn-file" title="Export GCODE to a file" onclick="saveFile()"><i class="fa fa-save fa-fw"></i>save</span></button>
+                </div>
+              </div>
+              <div class="card-block">
+                <div class="float-left">
+                  <table>
+                    <tr>
+                      <td>
+                        <span class="badge badge-pill badge-secondary">Line: <span id="gcodesent">0</span>/<span id="gcodetobesent">0</span></span>
+                      </td>
+                      <td>
+
+                      </td>
+                      <td>
+
+                      </td>
+                    </tr>
+                  </table>
+                </div>
+                <div id="editor"></div>
+              </div>
+              <div class="card-footer" style="height: 32px; padding-top: 2px; padding-left: 2px;">
+                <div class="float-left">
+                  <div class="btn-group btn-group-xs btn-group-justified btn-group-sm mr-2" role="group" aria-label="First group">
+                    <button data-toggle="tooltip" data-placement="bottom" title="Find and Replace" class="btn btn-xs btn-outline-secondary btn-file" onclick="editor.execCommand('replace')"><i class="fa fa-search fa-fw"></i></button>
+                    <button data-toggle="tooltip" data-placement="bottom" title="Select All" class="btn btn-xs btn-outline-secondary btn-file" onclick="editor.execCommand('selectall')"><i class="fa fa-clipboard fa-fw"></i></button>
+                    <button data-toggle="tooltip" data-placement="bottom" title="Undo" class="btn btn-xs btn-outline-secondary btn-file" onclick="editor.execCommand('undo')"><i class="fa fa-undo fa-fw"></i></button>
+                    <button data-toggle="tooltip" data-placement="bottom" title="Redo" class="btn btn-xs btn-outline-secondary btn-file" onclick="editor.execCommand('redo')"><i class="fa fa-repeat fa-fw"></i></button>
+                    <button data-toggle="tooltip" data-placement="bottom" title="Go to End" class="btn btn-xs btn-outline-secondary btn-file" onclick="editor.execCommand('gotoend')"><i class="fa fa-chevron-down fa-fw"></i></button>
+                    <button data-toggle="tooltip" data-placement="bottom" title="Go to Start" class="btn btn-xs btn-outline-secondary btn-file" onclick="editor.execCommand('gotostart')"><i class="fa fa-chevron-up fa-fw"></i></button>
+                    <button data-toggle="tooltip" data-placement="bottom" title="Clear Editor" class="btn btn-xs btn-outline-secondary btn-file" onclick="editor.execCommand('selectall'); editor.execCommand('del'); clearViewer(); doPreview();"><i class="fa fa-eraser fa-fw"></i></button>
+                    <!-- <button data-toggle="tooltip" data-placement="bottom" title="Editor Settings" class="btn btn-xs btn-outline-secondary btn-file" onclick="editor.execCommand('showSettingsMenu')"><i class="fa fa-cogs fa-fw"></i></span></button> -->
+                  </div>
+                </div>
+                <div class="float-right">
+                  <div class="btn-group btn-group-xs btn-group-justified btn-group-sm mr-2" role="group" aria-label="First group">
+                    <button data-toggle="tooltip" data-placement="bottom" title="Render GCODE Preview" class="btn btn-xs btn-success btn-file" onclick="doPreview();"><span id="previewbtntext"><i class="fa fa-star-o fa-fw"></i>preview</span></button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div class="col-md-8">
+            <div class="card">
+
+              <div class="card-header">
+                <div class="float-left">
+                  <h5>preview</h5>
+                </div>
+                <div class="float-right">
+                  <button data-toggle="tooltip" data-placement="bottom" title="Reset View" class="btn btn-sm btn-sm btn-outline-secondary" title="Empties Viewer Display" onclick="controls.reset()"><i class="fa fa-window-restore fa-fw"></i></span></button>
+                  <div class="btn-group" role="group" aria-label="Simulator">
+                    <button data-toggle="tooltip" data-placement="bottom" title="Run Simulator" id="simstartbtn" class="btn btn-sm btn-sm btn-outline-secondary" title="Run realtime simulation" onclick="sim(0);"><i class="fa fa-fighter-jet fa-fw"></i>sim play</button>
+                    <button data-toggle="tooltip" data-placement="bottom" title="Stop Simulator" id="simstopbtn" style="display: none;" class="btn btn-sm btn-sm btn-outline-secondary" title="Stop realtime simulation" onclick="simstop();"><i class="fa fa-stop fa-fw"></i>sim stop</button>
+                    <button data-toggle="tooltip" data-placement="bottom" title="Set Simulation Speed" class="btn btn-sm btn-sm btn-outline-secondary" title="Set sim speed" onclick="simSpeed();"><i class="fa fa-tachometer fa-fw"></i><span id="simspeedval">1</span>x</button>
+                  </div>
+                  <button data-toggle="tooltip" data-placement="bottom" title="Clear preview" class="btn btn-sm btn-sm btn-outline-secondary" title="Empties Viewer Display" onclick="editor.execCommand('selectall'); editor.execCommand('del'); clearViewer(); doPreview();"><i class="fa fa-eraser fa-fw"></i>clear</span></button>
+                </div>
+              </div>
+              <div class="card-block">
+                <div id="renderArea"></div>
+              </div>
+
+            </div>
+          </div>
+        </div>
+        <p>
+        <div class="row h-100">
+          <div class="col-md-4">
+            <div class="card">
+              <div class="card-header clearfix">
+                <div class="float-left">
+                  <!-- left -->
+                  <h5>Console</h5>
+                </div>
+                <div class="float-right">
+                  <!-- right -->
+                </div>
+              </div>
+              <div class="card-block">
+              </div>
+            </div>
+          </div>
+          <div class="col-md-8">
+            <div class="card">
+              <div class="card-header">
+                <div class="float-left">
+                  <h5>control</h5>
+                </div>
+                <div class="float-right">
+                </div>
+              </div>
+              <div class="card-block">
+                <!-- right content -->
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+   <footer class="footer">
+     <div class="container">
+       <span class="text-muted">cncpro.co (GPLv3)</span>
+     </div>
+   </footer>
+
+</div>
+
+<!-- Off-canvas Elements -->
+
+<!-- Context Menu for Editor -->
+<div class="dropdown-menu" id="editorContextMenu" aria-labelledby="dropdownMenuButton" style=" position: absolute; display:none;">
+  <h6 class="dropdown-header"><div class="float-left">Line <span id="linenumber"></span>: Options</div><div class="float-right"><button type="button" class="close" aria-label="Close" onclick="$('#editorContextMenu').hide()"><span aria-hidden="true">&times;</span></button></div></h6>
+  <span id="dropdowncontent"></span>
+</div>
+
+<!-- Modal for Rotation -->
+<div class="modal" id="rotate_modal">
+  <div class="modal-dialog" role="document">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title">rotate gcode</h5>
+        <button type="button" class="close" data-dismiss="modal" aria-label="Close">
+          <span aria-hidden="true">&times;</span>
+        </button>
+      </div>
+      <div class="modal-body">
+        <form class="form-inline">
+          <div class="input-group">
+            <span class="input-group-addon">Angle</span>
+            <input type="number" class="form-control" id="rotate_angle" value="0">
+            <span class="input-group-addon">&deg;</span>
+          </div>
+        </form>
+      </div>
+      <div class="modal-footer">
+        <button type="button" onclick="rotategcode($('#rotate_angle').val()); $('#rotate_modal').modal('hide');" class="btn btn-primary">rotate</button>
+        <button type="button" class="btn btn-secondary" data-dismiss="modal">Close</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+
+<!-- Modal for Scaling -->
+<div class="modal" id="scale_modal">
+  <div class="modal-dialog" role="document">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title">scale gcode</h5>
+        <button type="button" class="close" data-dismiss="modal" aria-label="Close">
+          <span aria-hidden="true">&times;</span>
+        </button>
+      </div>
+      <div class="modal-body">
+        <form class="form-inline">
+          <div class="input-group">
+            <span class="input-group-addon">X: </span>
+            <input type="number" class="form-control" id="scale_x_value" value="100">
+            <span class="input-group-addon">%</span>
+          </div>
+          <div class="input-group">
+            <span class="input-group-addon">Y: </span>
+            <input type="number" class="form-control" id="scale_y_value" value="100">
+            <span class="input-group-addon">%</span>
+          </div>
+          <div class="input-group">
+            <span class="input-group-addon">Z: </span>
+            <input type="number" class="form-control" id="scale_z_value" value="100">
+            <span class="input-group-addon">%</span>
+          </div>
+        </form>
+      </div>
+      <div class="modal-footer">
+        <button type="button" onclick="scalegcode($('#scale_x_value').val(), $('#scale_y_value').val(), $('#scale_z_value').val()); $('#scale_modal').modal('hide');" class="btn btn-primary">scale</button>
+        <button type="button" class="btn btn-secondary" data-dismiss="modal">Close</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Modal for Translation -->
+<div class="modal" id="translate_modal">
+  <div class="modal-dialog" role="document">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title">move gcode</h5>
+        <button type="button" class="close" data-dismiss="modal" aria-label="Close">
+          <span aria-hidden="true">&times;</span>
+        </button>
+      </div>
+      <div class="modal-body">
+        <form class="form-inline">
+          <div class="input-group">
+            <span class="input-group-addon">X: </span>
+            <input type="number" class="form-control" id="move_x_value" value="0">
+            <span class="input-group-addon">mm</span>
+          </div>
+        </form>
+        <form class="form-inline">
+          <div class="input-group">
+            <span class="input-group-addon">Y: </span>
+            <input type="number" class="form-control" id="move_y_value" value="0">
+            <span class="input-group-addon">mm</span>
+          </div>
+        </form>
+        <form class="form-inline">
+          <div class="input-group">
+            <span class="input-group-addon">Z: </span>
+            <input type="number" class="form-control" id="move_z_value" value="0">
+            <span class="input-group-addon">mm</span>
+          </div>
+        </form>
+      </div>
+      <div class="modal-footer">
+        <button type="button" onclick="movegcode($('#move_x_value').val(), $('#move_y_value').val(), $('#move_z_value').val()); $('#translate_modal').modal('hide');" class="btn btn-primary">move</button>
+        <button type="button" class="btn btn-secondary" data-dismiss="modal">Close</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+
+<!-- Modal for Feeds and Speeds -->
+<div class="modal" id="feeds_modal">
+  <div class="modal-dialog" role="document">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h5 class="modal-title">feeds and speeds</h5>
+        <button type="button" class="close" data-dismiss="modal" aria-label="Close">
+          <span aria-hidden="true">&times;</span>
+        </button>
+      </div>
+      <div class="modal-body">
+
+<label>Spindle speed in RPM:</label>
+<input class="form-control" type="text" name="speed" id="id_speed">
+<label>Number of Flutes: </label>
+<input class="form-control" type="text" name="flutes" id="id_flutes">
+<label>Select Material:</label>
+<select class="form-control" id="cnc_material">
+  <option value="0">Not selected</option>
+  <option value="1">Hard Wood</option>
+  <option value="2">Soft Wood and Plywood</option>
+  <option value="3">MDF / Particle Board</option>
+  <option value="4">Soft Plastic</option>
+  <option value="5">Hard Plastic</option>
+  <option value="6">Aluminium</option>
+</select>
+<label>Select Tool Diameter up to:</label>
+<select class="form-control" id="cnc_diameter">
+  <option value="0">Not selected</option>
+  <option value="1">3.1750 mm (0.1250 in - 1/8")</option>
+  <option value="2">6.3500 mm (0.2500 in - 1/4")</option>
+  <option value="3">9.5250 mm (0.3750 in - 3/8")</option>
+  <option value="4">12.7000 mm (0.5000 in - 1/2" &amp; Up)</option>
+</select>
+<p>
+<div id="feedrate"></div>
+
+      </div>
+      <div class="modal-footer">
+        <button type="button" onclick="calcfeed();" class="btn btn-primary">calculate feedrate</button>
+        <button type="button" class="btn btn-secondary" data-dismiss="modal">Close</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+
+  </body>
+
+
+
+  <script src="lib/nprogress/nprogress.js"></script>
+
+
+  <script src="lib/jquery/jquery.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/popper.js/1.11.0/umd/popper.min.js" integrity="sha384-b/U6ypiBEHpOf/4+1nzFpr53nxSS+GLCkfwBdFNTxtclqqenISfwAzpKaMNFNmj4" crossorigin="anonymous"></script>
+  <script src="lib/bootstrap/js/bootstrap.min.js"></script>
+  <script src="lib/ace/src-noconflict/ace.js"></script>
+  <script src="js/samplefile.js"></script>
+  <script type="text/javascript" src="lib/threejs/three.min.js"></script>
+  <script type="text/javascript" src="lib/threejs/GridRect.js"></script>
+  <script type="text/javascript" src="lib/threejs/OrbitControls.js"></script>
+  <script type="text/javascript" src="lib/threejs/Projector.js"></script>
+  <script type="text/javascript" src="lib/threejs/CanvasRenderer.js"></script>
+  <script type="text/javascript" src="lib/threejs/CSS3DRenderer.js"></script>
+  <script type="text/javascript" src="lib/threejs/TransformControls.js"></script>
+  <script type="text/javascript" src="lib/threejs/TweenMax.min.js"></script>
+
+  <script type="text/javascript" src="js/viewer.js"></script>
+
+  <script type="text/javascript" src="js/gcode-viewer/gcode-parser.js"></script>
+
+  <script type="text/javascript" src="js/gcodetools.js"></script>
+
+  <script type="text/javascript" src="js/toolcalc.js"></script>
+
+  <script type="text/javascript" src="/socket.io/socket.io.js"></script>
+  <script type="text/javascript" src="js/websocket.js"></script>
+
+  <script src="js/main.js"></script>
+</html>
